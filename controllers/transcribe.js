@@ -5,6 +5,10 @@ import supabase from "../utils/supabaseClient.js";
 const ASSEMBLY_KEY = process.env.ASSEMBLYAI_API_KEY;
 const BUCKET = process.env.SUPABASE_BUCKET;
 
+if (!ASSEMBLY_KEY) {
+  console.error("❌ Missing ASSEMBLYAI_API_KEY in env");
+}
+
 async function uploadFileToSupabase(file) {
   const fileBuffer = fs.readFileSync(file.path);
   const key = `${Date.now()}_${file.originalname}`;
@@ -31,9 +35,10 @@ async function createAssemblyTranscript(audioUrl) {
 
   let result;
   for (let i = 0; i < 60; i++) {
-    const resp = await axios.get(`https://api.assemblyai.com/v2/transcript/${id}`, {
-      headers: { authorization: ASSEMBLY_KEY },
-    });
+    const resp = await axios.get(
+      `https://api.assemblyai.com/v2/transcript/${id}`,
+      { headers: { authorization: ASSEMBLY_KEY } }
+    );
 
     if (resp.data.status === "completed") {
       result = resp.data;
@@ -52,40 +57,65 @@ async function createAssemblyTranscript(audioUrl) {
 export async function handleUploadAndTranscribe(req, res) {
   try {
     if (!req.file) return res.status(400).json({ error: "No file uploaded" });
-    if (!req.user) return res.status(401).json({ error: "Unauthorized" });
 
+    // ✅ Free trial limit if not logged in
+    if (!req.user) {
+      const { count, error: countErr } = await supabase
+        .from("transcriptions")
+        .select("*", { count: "exact", head: true })
+        .is("user_id", null);
+
+      if (countErr) throw countErr;
+      if (count >= 3) {
+        return res
+          .status(403)
+          .json({ error: "Free trial limit reached. Please sign up." });
+      }
+    }
+
+    // Upload to Supabase
     const uploadRes = await uploadFileToSupabase(req.file);
+
+    // Send to AssemblyAI
     const assemblyResult = await createAssemblyTranscript(uploadRes.publicURL);
+
+    const record = {
+      user_id: req.user ? req.user.id : null, // ✅ trial mode = null
+      filename: req.file.originalname,
+      audio_path: uploadRes.path,
+      audio_public_url: uploadRes.publicURL,
+      transcription: assemblyResult.text || null,
+      status: assemblyResult.status,
+      provider: "assemblyai",
+      provider_id: assemblyResult.id,
+    };
 
     const { data, error } = await supabase
       .from("transcriptions")
-      .insert([
-        {
-          user_id: req.user.id,
-          filename: req.file.originalname,
-          audio_path: uploadRes.path,
-          audio_public_url: uploadRes.publicURL,
-          transcription: assemblyResult.text || null,
-          status: assemblyResult.status,
-          provider: "assemblyai",
-          provider_id: assemblyResult.id,
-        },
-      ])
+      .insert([record])
       .select();
 
     if (error) throw error;
 
     fs.unlinkSync(req.file.path);
 
-    res.json({ success: true, transcription: assemblyResult.text, record: data[0] });
+    res.json({
+      success: true,
+      transcription: assemblyResult.text,
+      record: data[0],
+      freeTrial: !req.user,
+    });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error("❌ Transcribe error:", err);
+    res.status(500).json({ error: err.message || err.toString() });
   }
 }
 
 export async function getTranscriptions(req, res) {
   try {
-    if (!req.user) return res.status(401).json({ error: "Unauthorized" });
+    if (!req.user) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
 
     const { data, error } = await supabase
       .from("transcriptions")
@@ -95,6 +125,7 @@ export async function getTranscriptions(req, res) {
       .limit(100);
 
     if (error) throw error;
+
     res.json({ data });
   } catch (err) {
     res.status(500).json({ error: err.message });
