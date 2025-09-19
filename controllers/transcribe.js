@@ -1,133 +1,57 @@
 import fs from "fs";
-import axios from "axios";
-import supabase from "../utils/supabaseClient.js";
+import { createClient } from "@deepgram/sdk";
+import { Transcription } from "../model/transcription.js";
 
-const ASSEMBLY_KEY = process.env.ASSEMBLYAI_API_KEY;
-const BUCKET = process.env.SUPABASE_BUCKET;
+export const transcribe = async (req, res) => {
+  try {
+    if (!req.user) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+    if (!req.file) {
+      return res.status(400).json({ error: "No audio file uploaded" });
+    }
 
-if (!ASSEMBLY_KEY) {
-  console.error("❌ Missing ASSEMBLYAI_API_KEY in env");
-}
+    const deepgram = createClient(process.env.DEEPGRAM_API_KEY);
 
-async function uploadFileToSupabase(file) {
-  const fileBuffer = fs.readFileSync(file.path);
-  const key = `${Date.now()}_${file.originalname}`;
+    const filePath = req.file.path;
+    const mimetype = req.file.mimetype || "audio/webm";
 
-  const { error } = await supabase.storage
-    .from(BUCKET)
-    .upload(key, fileBuffer, { contentType: file.mimetype, upsert: false });
+    const buffer = fs.readFileSync(filePath);
 
-  if (error) throw error;
-
-  const { data: publicData } = supabase.storage.from(BUCKET).getPublicUrl(key);
-
-  return { path: key, publicURL: publicData.publicUrl };
-}
-
-async function createAssemblyTranscript(audioUrl) {
-  const createResp = await axios.post(
-    "https://api.assemblyai.com/v2/transcript",
-    { audio_url: audioUrl },
-    { headers: { authorization: ASSEMBLY_KEY } }
-  );
-
-  const id = createResp.data.id;
-
-  let result;
-  for (let i = 0; i < 60; i++) {
-    const resp = await axios.get(
-      `https://api.assemblyai.com/v2/transcript/${id}`,
-      { headers: { authorization: ASSEMBLY_KEY } }
+    const result = await deepgram.listen.prerecorded.transcribeFile(
+      { buffer, mimetype },
+      { model: "nova-2", smart_format: true }
     );
 
-    if (resp.data.status === "completed") {
-      result = resp.data;
-      break;
-    }
-    if (resp.data.status === "error") {
-      throw new Error("Transcription error: " + resp.data.error);
-    }
-    await new Promise((r) => setTimeout(r, 1000));
-  }
+    const transcript =
+      result?.results?.channels?.[0]?.alternatives?.[0]?.transcript || "";
 
-  if (!result) throw new Error("Transcription timed out");
-  return result;
-}
-
-export async function handleUploadAndTranscribe(req, res) {
-  try {
-    if (!req.file) return res.status(400).json({ error: "No file uploaded" });
-
-    // ✅ Free trial limit if not logged in
-    if (!req.user) {
-      const { count, error: countErr } = await supabase
-        .from("transcriptions")
-        .select("*", { count: "exact", head: true })
-        .is("user_id", null);
-
-      if (countErr) throw countErr;
-      if (count >= 3) {
-        return res
-          .status(403)
-          .json({ error: "Free trial limit reached. Please sign up." });
-      }
-    }
-
-    // Upload to Supabase
-    const uploadRes = await uploadFileToSupabase(req.file);
-
-    // Send to AssemblyAI
-    const assemblyResult = await createAssemblyTranscript(uploadRes.publicURL);
-
-    const record = {
-      user_id: req.user ? req.user.id : null, // ✅ trial mode = null
+    const record = await Transcription.create({
+      userId: req.user.id,
       filename: req.file.originalname,
-      audio_path: uploadRes.path,
-      audio_public_url: uploadRes.publicURL,
-      transcription: assemblyResult.text || null,
-      status: assemblyResult.status,
-      provider: "assemblyai",
-      provider_id: assemblyResult.id,
-    };
-
-    const { data, error } = await supabase
-      .from("transcriptions")
-      .insert([record])
-      .select();
-
-    if (error) throw error;
-
-    fs.unlinkSync(req.file.path);
-
-    res.json({
-      success: true,
-      transcription: assemblyResult.text,
-      record: data[0],
-      freeTrial: !req.user,
+      transcription: transcript,
+      provider: "deepgram",
     });
-  } catch (err) {
-    console.error("❌ Transcribe error:", err);
-    res.status(500).json({ error: err.message || err.toString() });
-  }
-}
 
-export async function getTranscriptions(req, res) {
+    fs.unlinkSync(filePath);
+
+    return res.json({ transcription: transcript, id: record._id });
+  } catch (err) {
+    console.error("Error in transcribe:", err);
+    return res.status(500).json({ error: "Transcription failed", details: err.message });
+  }
+};
+
+export const history = async (req, res) => {
   try {
     if (!req.user) {
       return res.status(401).json({ error: "Unauthorized" });
     }
 
-    const { data, error } = await supabase
-      .from("transcriptions")
-      .select("*")
-      .eq("user_id", req.user.id)
-      .order("created_at", { ascending: false })
-      .limit(100);
-
-    if (error) throw error;
-
-    res.json({ data });
+    const records = await Transcription.find({ userId: req.user.id }).sort({ createdAt: -1 });
+    return res.json({ records });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error("Error fetching history:", err);
+    return res.status(500).json({ error: "Could not fetch history", details: err.message });
   }
-}
+};

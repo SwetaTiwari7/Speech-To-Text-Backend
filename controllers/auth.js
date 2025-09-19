@@ -1,68 +1,57 @@
-import bcrypt from "bcryptjs";
-import jwt from "jsonwebtoken";
-import supabase from "../utils/supabaseClient.js";
+import { User } from "../model/user.js";
+import {
+  generateAccessToken,
+  generateRefreshToken,
+  verifyRefreshToken,
+} from "../utils/jwt.js";
 
-const JWT_SECRET = process.env.JWT_SECRET;
-
-export async function signup(req, res) {
-  try {
-    const { email, password, username } = req.body;
-    if (!email || !password) {
-      return res.status(400).json({ error: "Email and password required" });
-    }
-
-    const { data: existing } = await supabase
-      .from("users")
-      .select("*")
-      .eq("email", email)
-      .limit(1);
-
-    if (existing && existing.length > 0) {
-      return res.status(400).json({ error: "Email already in use" });
-    }
-
-    const hash = await bcrypt.hash(password, 10);
-
-    const { data, error } = await supabase
-      .from("users")
-      .insert([{ email, password_hash: hash }])
-      .select();
-
-    if (error) throw error;
-
-    const user = data[0];
-    const token = jwt.sign({ id: user.id }, JWT_SECRET, { expiresIn: "7d" });
-
-    res.json({ token, user });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-}
-
-export async function login(req, res) {
+export const register = async (req, res) => {
   try {
     const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ error: "Missing fields" });
 
-    const { data: users } = await supabase
-      .from("users")
-      .select("*")
-      .eq("email", email)
-      .limit(1);
+    const exists = await User.findOne({ email });
+    if (exists) return res.status(400).json({ error: "User already exists" });
 
-    if (!users || users.length === 0) {
-      return res.status(400).json({ error: "Invalid credentials" });
-    }
+    const user = new User({ email, password });
+    await user.save();
 
-    const user = users[0];
-    const valid = await bcrypt.compare(password, user.password_hash);
-    if (!valid) {
-      return res.status(400).json({ error: "Invalid credentials" });
-    }
+    const accessToken = generateAccessToken(user);
+    const refreshToken = generateRefreshToken(user);
 
-    const token = jwt.sign({ id: user.id }, JWT_SECRET, { expiresIn: "7d" });
-
-    res.json({ token, user });
+    res.status(201).json({ user: { id: user._id, email }, accessToken, refreshToken });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
-}
+};
+
+export const login = async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const user = await User.findOne({ email });
+    if (!user || !(await user.matchPassword(password))) {
+      return res.status(401).json({ error: "Invalid credentials" });
+    }
+
+    const accessToken = generateAccessToken(user);
+    const refreshToken = generateRefreshToken(user);
+
+    res.json({ user: { id: user._id, email }, accessToken, refreshToken });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+export const refresh = async (req, res) => {
+  try {
+    const { token } = req.body;
+    if (!token) return res.status(400).json({ error: "Missing refresh token" });
+
+    const decoded = verifyRefreshToken(token);
+    const accessToken = generateAccessToken(decoded);
+
+    res.json({ accessToken });
+  } catch (err) {
+    res.status(401).json({ error: "Invalid refresh token" });
+  }
+};
